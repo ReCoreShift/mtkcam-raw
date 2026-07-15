@@ -1,0 +1,6 @@
+# mtkcam-raw has no runtime dependencies (stdlib only).
+# Install the package itself:
+#   pip install .
+#
+# For development:
+#   pip install -e ".[dev]"
