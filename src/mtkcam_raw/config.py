@@ -1,17 +1,6 @@
-# This Source Code Form is subject to the terms of the Mozilla Public
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
 """
 Configuration file support — TOML-based patch configuration.
-
-Allows users to specify patch settings in a single config.toml
-instead of passing many CLI flags.
 """
-
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
 
 from __future__ import annotations
 
@@ -32,7 +21,6 @@ from mtkcam_raw.metadata import (
 
 @dataclass
 class PatchConfig:
-    """Settings that can be loaded from config.toml."""
     sensor: Optional[str] = None
     all: bool = False
     main_sensors: list[str] = field(default_factory=list)
@@ -47,9 +35,6 @@ class PatchConfig:
 
 
 def load_config(path: Path) -> PatchConfig:
-    """
-    Read and parse a TOML config file into a PatchConfig.
-    """
     data = path.read_bytes()
     parsed = tomllib.loads(data.decode("utf-8"))
     return _parse_toml_to_config(parsed)
@@ -86,7 +71,6 @@ def _parse_toml_to_config(parsed: dict) -> PatchConfig:
                         if isinstance(entry, dict):
                             entries.append(stream_entry_from_dict(entry))
                         elif isinstance(entry, list):
-                            # positional: [format, width, height, direction, hal, override]
                             n = len(entry)
                             fmt = resolve_format(entry[0]) if n > 0 else HAL_PIXEL_FORMAT_RAW16
                             w = int(str(entry[1]), 0) if n > 1 else 0
@@ -107,7 +91,6 @@ def _parse_toml_to_config(parsed: dict) -> PatchConfig:
                 if isinstance(entry, dict):
                     cfg.stream_entries.append(stream_entry_from_dict(entry))
                 elif isinstance(entry, list):
-                    # Old-style positional: [format, width, height, direction, hal, override]
                     n = len(entry)
                     fmt = resolve_format(entry[0]) if n > 0 else HAL_PIXEL_FORMAT_RAW16
                     w = int(str(entry[1]), 0) if n > 1 else 0
@@ -128,12 +111,14 @@ def _parse_toml_to_config(parsed: dict) -> PatchConfig:
     return cfg
 
 
-def _entry_to_cli_string(entry: StreamEntry) -> str:
-    """Serialize a StreamEntry to the CLI comma-separated format."""
-    t = entry.to_tuple()
+def _entry_to_cli_string(
+    entry: StreamEntry,
+    hal_format_meta: Optional[dict[int, tuple[int, int]]] = None,
+) -> str:
+    t = entry.to_tuple(hal_format_meta)
     parts: list[str] = []
     for i, v in enumerate(t):
-        if i >= 4:  # hal_pixel_format, override_format as hex
+        if i >= 4:
             parts.append(hex(v))
         else:
             parts.append(str(v))
@@ -144,58 +129,43 @@ def merge_config_into_args(
     config: PatchConfig,
     args: dict,
     defaults: dict,
+    hal_format_meta: Optional[dict[int, tuple[int, int]]] = None,
 ) -> dict:
-    """
-    Override CLI defaults with config file values.
-
-    Only applies when the CLI arg is still at its parser default
-    (i.e., the user did not explicitly pass it).
-    """
     overrides: dict[str, object] = {}
 
-    # sensor: str | None
     if config.sensor is not None and args.get("sensor") == defaults.get("sensor"):
         overrides["sensor"] = config.sensor
 
-    # main_sensors: list[str] (not a CLI flag, attach to namespace)
     if config.main_sensors:
         overrides["main_sensors"] = config.main_sensors
 
-    # all: bool
     if config.all and not args.get("all"):
         overrides["all"] = True
 
-    # caps: list[str] from config -> comma-separated str for CLI
     if config.caps and args.get("caps") == defaults.get("caps", ""):
         overrides["caps"] = ",".join(config.caps)
 
-    # tier: list[str] from config -> comma-separated str for CLI
     if config.tier and args.get("tier") == defaults.get("tier", ""):
         overrides["tier"] = ",".join(config.tier)
 
-    # stream: bool
     if config.stream and not args.get("stream"):
         overrides["stream"] = True
 
-    # stream_entries: StreamEntry list -> CLI list of comma-sep strings
     if config.stream_entries and not args.get("stream_entries_list"):
         overrides["stream_entries_list"] = [
-            _entry_to_cli_string(entry)
+            _entry_to_cli_string(entry, hal_format_meta)
             for entry in config.stream_entries
         ]
 
-    # sensor_streams: per-sensor entries dict (not a CLI flag)
     if config.sensor_streams:
         overrides["sensor_streams"] = {
-            k: [_entry_to_cli_string(e) for e in v]
+            k: [_entry_to_cli_string(e, hal_format_meta) for e in v]
             for k, v in config.sensor_streams.items()
         }
 
-    # quiet
     if config.quiet and not args.get("quiet"):
         overrides["quiet"] = True
 
-    # output
     if config.output is not None and args.get("output") == defaults.get("output"):
         overrides["output"] = Path(config.output)
 
@@ -204,7 +174,6 @@ def merge_config_into_args(
 
 
 def generate_default() -> str:
-    """Return the default config.toml content as a string."""
     fmt_names = ", ".join(FORMAT_NAMES.values())
     return textwrap.dedent(f"""\
         # mtkcam-raw configuration

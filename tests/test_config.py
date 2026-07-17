@@ -1,7 +1,3 @@
-# This Source Code Form is subject to the terms of the Mozilla Public
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
 """Tests for configuration file support."""
 
 
@@ -15,6 +11,7 @@ from mtkcam_raw.config import (
     merge_config_into_args,
 )
 from mtkcam_raw.metadata import StreamEntry
+from mtkcam_raw.devices import INOI_A75
 
 
 def _write_toml(content: str) -> Path:
@@ -38,10 +35,6 @@ class TestLoadConfig:
 
     def test_all_fields(self):
         path = _write_toml("""\
-
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
 sensor = "S5KJN1"
 all = true
 caps = ["RAW", "BURST_CAPTURE"]
@@ -67,8 +60,8 @@ format = "RAW16"
         e = cfg.stream_entries[0]
         assert e.width == 4080
         assert e.height == 3072
-        assert e.format == 32  # RAW16
-        assert e.direction == 0  # OUTPUT
+        assert e.format == 32
+        assert e.direction == 0
 
     def test_old_style_list_entries(self):
         path = _write_toml("""\
@@ -90,9 +83,8 @@ stream_entries = [
         assert e1.height == 1536
         assert e1.direction == 0
         assert e1.hal_pixel_format is None
-        # to_tuple should resolve defaults
-        t1 = e1.to_tuple()
-        assert t1[4] == 0x3F940AA  # resolved from HAL_FORMAT_META
+        t1 = e1.to_tuple(INOI_A75.hal_format_meta)
+        assert t1[4] == 0x3F940AA
 
     def test_partial_config(self):
         path = _write_toml('caps = ["RAW"]\nsensor = "IMX"')
@@ -114,7 +106,7 @@ direction = "OUTPUT"
         e = cfg.stream_entries[0]
         assert e.width == 1920
         assert e.height == 1080
-        assert e.format == 33  # YUV_420_888
+        assert e.format == 33
         assert e.direction == 0
 
 
@@ -150,7 +142,9 @@ class TestMergeConfigIntoArgs:
             "all": False,
         }
 
-        merged = merge_config_into_args(cfg, args, defaults)
+        merged = merge_config_into_args(
+            cfg, args, defaults, INOI_A75.hal_format_meta,
+        )
 
         assert merged["sensor"] == "S5KJN1"
         assert merged["caps"] == "RAW,BURST_CAPTURE"
@@ -170,7 +164,9 @@ class TestMergeConfigIntoArgs:
         }
         defaults = {"sensor": None, "caps": "", "tier": "", "stream": False}
 
-        merged = merge_config_into_args(cfg, args, defaults)
+        merged = merge_config_into_args(
+            cfg, args, defaults, INOI_A75.hal_format_meta,
+        )
 
         assert merged["sensor"] == "IMX586"
         assert merged["caps"] == "RAW"

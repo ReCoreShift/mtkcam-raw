@@ -1,0 +1,22 @@
+main_sensors = [
+    "IMX686",
+    "HI846",
+]
+
+tier = [
+    "RAW",
+    "MANUAL_POST_PROCESSING",
+    "PRIVATE_REPROCESSING",
+    "READ_SENSOR_SETTINGS_2",
+    "HIGH_SPEED_VIDEO",
+]
+
+stream = true
+
+[sensor_streams]
+IMX686 = [
+    {width = 4624, height = 3472},
+]
+HI846 = [
+    {width = 3264, height = 2448},
+]

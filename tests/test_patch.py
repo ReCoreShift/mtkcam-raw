@@ -1,13 +1,4 @@
-# This Source Code Form is subject to the terms of the Mozilla Public
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
 """Tests for patch module."""
-
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
-
 
 import os
 import struct
@@ -25,6 +16,7 @@ from mtkcam_raw.analysis import (
     BinaryProfile,
 )
 from mtkcam_raw.aarch64 import decode_branch_target
+from mtkcam_raw.devices import INOI_A75
 
 BINARY = os.environ.get("TEST_BINARY")
 if BINARY is None:
@@ -33,7 +25,11 @@ if BINARY is None:
             BINARY = candidate
             break
 if BINARY is None:
-    BINARY = "/tmp/libmtkcam_metastore_original.so"
+    raise FileNotFoundError(
+        "No test binary found. Set TEST_BINARY or place libmtkcam_metastore.so in the project root or bin/"
+    )
+
+PREFIX = INOI_A75.sensor_prefix
 
 
 @pytest.fixture(scope="module")
@@ -76,7 +72,7 @@ class TestFindCaves:
 
 class TestMakeCapabilityPatches:
     def test_s5kjn1_raw_append(self, image):
-        blocks = analyze_all_capabilities(image)
+        blocks = analyze_all_capabilities(image, PREFIX)
         s5kjn1 = [b for b in blocks if "S5KJN1" in b.sensor_name][0]
         allocator = CaveAllocator.from_image(image)
 
@@ -90,7 +86,7 @@ class TestMakeCapabilityPatches:
         assert len(patches) >= 2
 
     def test_preserves_existing_cap(self, image):
-        blocks = analyze_all_capabilities(image)
+        blocks = analyze_all_capabilities(image, PREFIX)
         s5kjn1 = [b for b in blocks if "S5KJN1" in b.sensor_name][0]
         allocator = CaveAllocator.from_image(image)
         last_slot = s5kjn1.slots[-1]
@@ -103,7 +99,6 @@ class TestMakeCapabilityPatches:
         result = apply_patches(data, patches)
         assert result.is_valid
 
-        # Original slot value preserved (movz instruction unchanged)
         original_val = struct.unpack("<I", image.data[last_slot.file_offset:last_slot.file_offset+4])[0]
         patched_val = struct.unpack("<I", data[last_slot.file_offset:last_slot.file_offset+4])[0]
         assert original_val == patched_val
@@ -111,7 +106,7 @@ class TestMakeCapabilityPatches:
 
 class TestMakeStreamPatches:
     def test_s5kjn1_stream_append(self, image):
-        hooks = find_all_stream_hooks(image)
+        hooks = find_all_stream_hooks(image, PREFIX)
         s5kjn1 = [h for h in hooks if "S5KJN1" in h.sensor_name][0]
         allocator = CaveAllocator.from_image(image)
 
@@ -130,7 +125,6 @@ class TestMakeStreamPatches:
         result = apply_patches(data, patches)
         assert result.is_valid
 
-        # Verify hook redirect was changed
         old_bl = struct.unpack("<I", image.data[s5kjn1.entry_for_call_offset:s5kjn1.entry_for_call_offset+4])[0]
         new_bl = struct.unpack("<I", data[s5kjn1.entry_for_call_offset:s5kjn1.entry_for_call_offset+4])[0]
         assert old_bl != new_bl, "hook BL was not redirected"
@@ -139,7 +133,7 @@ class TestMakeStreamPatches:
         assert target is not None
 
     def test_multiple_entries(self, image):
-        hooks = find_all_stream_hooks(image)
+        hooks = find_all_stream_hooks(image, PREFIX)
         s5kjn1 = [h for h in hooks if "S5KJN1" in h.sensor_name][0]
         allocator = CaveAllocator.from_image(image)
 

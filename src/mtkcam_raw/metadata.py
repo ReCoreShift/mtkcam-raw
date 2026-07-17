@@ -1,14 +1,6 @@
-# This Source Code Form is subject to the terms of the Mozilla Public
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
 """
 Android Camera2 metadata constants relevant to RAW enablement.
 """
-
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
 
 from __future__ import annotations
 
@@ -119,15 +111,8 @@ FORMAT_NAME_TO_VALUE: dict[str, int] = {
     v: k for k, v in FORMAT_NAMES.items()
 }
 
-# MediaTek HAL-specific metadata per format.
-# (hal_pixel_format, override_format) — derived from known RAW16 entry.
-HAL_FORMAT_META: dict[int, tuple[int, int]] = {
-    32: (0x3F940AA, 0x1FCA055),
-}
-
 
 def resolve_format(value: str | int) -> int:
-    """Resolve a format string (e.g. \"RAW16\") or int to its integer value."""
     if isinstance(value, int):
         return value
     upper = value.upper()
@@ -140,7 +125,6 @@ def resolve_format(value: str | int) -> int:
 
 @dataclass
 class StreamEntry:
-    """A single stream configuration entry with named fields."""
     width: int
     height: int
     format: int = 32  # HAL_PIXEL_FORMAT_RAW16
@@ -148,12 +132,16 @@ class StreamEntry:
     hal_pixel_format: Optional[int] = None
     override_format: Optional[int] = None
 
-    def to_tuple(self) -> tuple[int, ...]:
-        """Resolve all fields into the 6-element tuple for the trampoline."""
+    def to_tuple(
+        self,
+        hal_format_meta: Optional[dict[int, tuple[int, int]]] = None,
+    ) -> tuple[int, ...]:
+        if hal_format_meta is None:
+            hal_format_meta = {}
         hpf = self.hal_pixel_format
         ovf = self.override_format
         if hpf is None or ovf is None:
-            defaults = HAL_FORMAT_META.get(self.format)
+            defaults = hal_format_meta.get(self.format)
             if defaults:
                 if hpf is None:
                     hpf = defaults[0]
@@ -168,13 +156,12 @@ class StreamEntry:
 
 
 def stream_entry_from_dict(d: dict) -> StreamEntry:
-    """Build a StreamEntry from a user-facing dict (config.toml row)."""
     kwargs: dict = {}
 
-    raw_fmt = d.get("format", 32)  # RAW16 default
+    raw_fmt = d.get("format", 32)
     kwargs["format"] = resolve_format(raw_fmt)
 
-    raw_dir = d.get("direction", 0)  # OUTPUT default
+    raw_dir = d.get("direction", 0)
     if isinstance(raw_dir, str):
         upper = raw_dir.upper().strip()
         if upper == "OUTPUT":
@@ -206,33 +193,18 @@ DIRECTION_NAMES: dict[int, str] = {
 }
 
 
-SKIP_SUFFIXES = (
-    "_securecamera",
-    "_bayermono",
-    "_bayerbayer",
-    "_bayerwide",
-    "_dummy",
-    "_satcam",
-    "_vsdof",
-    "_lvsdof",
-    "_fvsdof",
-    "_dualzoom",
-    "_tricam",
-    "_trivsdof",
-    "_trizvsdof",
-    "_staggerTriZoom",
-    "_staggerZoom",
-    "_securecamera",
-)
-
-
-def is_submode(sensor_name: str) -> bool:
+def is_submode(
+    sensor_name: str,
+    skip_suffixes: tuple[str, ...] = ("_securecamera",),
+) -> bool:
     lower = sensor_name.lower()
-    return any(lower.endswith(sfx.lower()) for sfx in SKIP_SUFFIXES)
+    return any(lower.endswith(sfx.lower()) for sfx in skip_suffixes)
 
 
-def sensor_short_name(sym_name: str) -> str:
-    prefix = "constructCustStaticMetadata_PLATFORM_PROJECT_SENSOR_DRVNAME_"
+def sensor_short_name(
+    sym_name: str,
+    prefix: str = "constructCustStaticMetadata_PLATFORM_PROJECT_SENSOR_DRVNAME_",
+) -> str:
     if sym_name.startswith(prefix):
         return sym_name[len(prefix):]
     return sym_name

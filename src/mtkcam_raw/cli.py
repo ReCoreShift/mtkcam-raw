@@ -1,14 +1,8 @@
-# This Source Code Form is subject to the terms of the Mozilla Public
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
 """
 CLI — command parsing and output presentation for mtkcam-raw.
+Device-agnostic: every offset and parameter is read from the
+device definition (see ``mtkcam_raw.devices``).
 """
-
-# License, v. 2.0. If a copy of the MPL was not distributed with this
-# file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
 
 from __future__ import annotations
 
@@ -17,6 +11,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from mtkcam_raw.devices import DeviceConfig, get_device
 from mtkcam_raw.elf import parse_elf
 from mtkcam_raw.cave import CaveAllocator
 from mtkcam_raw.analysis import (
@@ -54,7 +49,6 @@ from mtkcam_raw.verify import (
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
-    """Inspect ELF structure."""
     data = args.path.read_bytes()
     errors = validate_elf_structure(data)
     if errors:
@@ -63,12 +57,14 @@ def cmd_inspect(args: argparse.Namespace) -> int:
         return 1
 
     image = parse_elf(data)
+    device: DeviceConfig = args.device_obj
 
     print(f"Library: {args.path}")
     print(f"  SHA256:  {image.sha256}")
     print(f"  Size:    {len(data)} bytes")
     print("  ELF:     64-bit LSB ARM AArch64")
     print(f"  BIND_NOW: {'yes' if image.check_bind_now() else 'no'}")
+    print(f"  Device:  {device.name} (SoC {device.soc})")
     print()
 
     print("Program headers:")
@@ -100,10 +96,10 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     if gap_cave:
         print(f"LOAD1-LOAD2 gap: 0x{gap_cave.va:x} ({gap_cave.size}B)")
 
-    sensors = find_sensor_symbols(image)
+    sensors = find_sensor_symbols(image, device.sensor_prefix)
     print(f"\nSensor functions: {len(sensors)}")
     for s in sensors[:5]:
-        print(f"  0x{s.value:08x}  {sensor_short_name(s.name)}")
+        print(f"  0x{s.value:08x}  {sensor_short_name(s.name, device.sensor_prefix)}")
     if len(sensors) > 5:
         print(f"  ... and {len(sensors) - 5} more")
 
@@ -111,22 +107,22 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 
 
 def cmd_analyze(args: argparse.Namespace) -> int:
-    """Analyze binary for patch sites."""
     data = args.path.read_bytes()
     image = parse_elf(data)
+    device: DeviceConfig = args.device_obj
 
     print(f"Analyzing {args.path}")
     print(f"  SHA256: {image.sha256}")
+    print(f"  Device: {device.name}")
     print()
 
-    # Capability blocks
-    cap_blocks = analyze_all_capabilities(image)
+    cap_blocks = analyze_all_capabilities(image, device.sensor_prefix)
     print(f"Capability blocks found: {len(cap_blocks)}")
 
     for block in cap_blocks:
         if args.sensor and args.sensor.upper() not in block.sensor_name.upper():
             continue
-        if not args.all and is_submode(block.sensor_name):
+        if not args.all and is_submode(block.sensor_name, device.skip_suffixes):
             continue
 
         cap_str = " ".join(f"{cap_name(v)}({v})" for v in block.values)
@@ -139,8 +135,7 @@ def cmd_analyze(args: argparse.Namespace) -> int:
             print(f"      slot 0x{slot.file_offset:06x}: {cap_name(slot.value)}({slot.value})")
             print(f"        -> bl 0x{slot.push_back_target_va:x}")
 
-    # Stream hooks
-    stream_hooks = find_all_stream_hooks(image)
+    stream_hooks = find_all_stream_hooks(image, device.sensor_prefix)
     print(f"\nStream config hooks (tag 0xd0012): {len(stream_hooks)}")
     for hook in stream_hooks:
         if args.sensor and args.sensor.upper() not in hook.sensor_name.upper():
@@ -148,9 +143,8 @@ def cmd_analyze(args: argparse.Namespace) -> int:
         print(f"  {hook.sensor_name}: bl entryFor at 0x{hook.hook_va:x}")
         print(f"    Tag at file 0x{hook.tag_file_offset:x}")
 
-    # Binary profile
     try:
-        profile = discover_binary_profile(image)
+        profile = discover_binary_profile(image, device.sensor_prefix)
         print("\nBinary profile:")
         print(f"  entry_for_va   = 0x{profile.entry_for_va:x}")
         print(f"  push_long_va   = 0x{profile.push_long_va:x}")
@@ -161,12 +155,23 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
 
 def cmd_patch(args: argparse.Namespace) -> int:
-    """Apply patches to enable RAW support."""
     data = args.path.read_bytes()
     image = parse_elf(data)
+    device: DeviceConfig = args.device_obj
 
-    print(f"Patching {args.path}")
+    print(f"Patching {args.path}  ({device.name})")
     print(f"  Input SHA256: {image.sha256}")
+
+    if getattr(args, "validate_first", False):
+        issues = device.validate_library(data)
+        if issues:
+            print("  Device library validation issues:")
+            for iss in issues:
+                print(f"    {iss}")
+            if not getattr(args, "force", False):
+                print("  Aborting. Use --force to patch anyway.")
+                return 1
+            print("  (forcing patch despite issues)")
 
     if not args.output:
         args.output = args.path.with_suffix(".patched.so")
@@ -174,21 +179,49 @@ def cmd_patch(args: argparse.Namespace) -> int:
     in_path = args.path
     out_path = args.output
 
+    # Allow TOML/CLI to override device's main_sensor priorities
+    main_sensors_override: list[str] = getattr(args, "main_sensors", [])
+    if main_sensors_override:
+        device = device.with_main_sensors(main_sensors_override)
+
     allocator = CaveAllocator.from_image(image)
     if allocator.remaining == 0:
         print("ERROR: No suitable code cave found")
         return 1
 
-    # Discover binary helper addresses
     try:
-        profile = discover_binary_profile(image)
+        profile = discover_binary_profile(image, device.sensor_prefix)
     except ValueError as e:
         print(f"ERROR: {e}")
         return 1
 
     patches: list[PatchRecord] = []
 
-    # Determine desired cap set: --tier overrides --caps
+    # ── Hardware-level patch ──────────────────────────────────────────
+    if device.patches.hwlevel is not None:
+        hp = device.patches.hwlevel
+        off = device.resolve_patch_offset(data, hp)
+        if off is None:
+            print(
+                "WARNING: hwlevel signature not found and no fallback offset — "
+                "skipping LEVEL_3 force"
+            )
+        else:
+            actual = data[off:off + len(hp.old_bytes)]
+            if actual != hp.old_bytes:
+                print(
+                    f"WARNING: hwlevel patch at 0x{off:x} has bytes "
+                    f"{actual.hex()} (expected {hp.old_bytes.hex()}) — skipping"
+                )
+            else:
+                patches.append(PatchRecord(
+                    file_offset=off,
+                    old_bytes=hp.old_bytes,
+                    new_bytes=hp.new_bytes,
+                    description=f"hwlevel: force LEVEL_3 (csel ne→al) [{device.name}]",
+                ))
+
+    # ── Resolve desired capabilities ──────────────────────────────────
     cap_spec: str | None = None
     cap_intent: str = ""
     if args.tier:
@@ -197,25 +230,17 @@ def cmd_patch(args: argparse.Namespace) -> int:
     elif args.caps:
         cap_spec = args.caps
         cap_intent = "caps"
+    elif device.desired_cap_tier:
+        cap_spec = ",".join(device.desired_cap_tier)
+        cap_intent = f"device default tier [{device.name}]"
 
-    main_sensors: list[str] = getattr(args, "main_sensors", [])
-    syms = find_sensor_symbols(image)
+    # ── Sort sensors: main first, then others ─────────────────────────
+    syms = find_sensor_symbols(image, device.sensor_prefix)
+    syms.sort(key=lambda s: device.get_priority(
+        sensor_short_name(s.name, device.sensor_prefix)
+    ))
 
-    def priority_key(sym):
-        sname = sensor_short_name(sym.name)
-        for i, m in enumerate(main_sensors):
-            if m in sname:
-                return i
-        return 999
-
-    syms.sort(key=priority_key)
-
-    def find_sensor_sym(sensor_syms, sensor_name):
-        for s in sensor_syms:
-            if sensor_short_name(s.name) == sensor_name:
-                return s
-        return sensor_syms[0] if sensor_syms else None
-
+    # ── Capability patches ────────────────────────────────────────────
     if cap_spec:
         if not image.check_bind_now():
             print("ERROR: BIND_NOW not set; PLT[0] cave is unsafe")
@@ -224,14 +249,14 @@ def cmd_patch(args: argparse.Namespace) -> int:
         desired_caps = parse_cap_values(cap_spec)
         print(f"\nDesired capabilities ({cap_intent}): {[cap_name(c) for c in desired_caps]}")
 
-        # Phase 1: main sensors' caps
+        # Main sensors
         for sym in syms:
-            if priority_key(sym) >= 999:
+            sname = sensor_short_name(sym.name, device.sensor_prefix)
+            if not device.is_main_sensor(sname):
                 continue
-            sname = sensor_short_name(sym.name)
             if args.sensor and args.sensor.upper() not in sname.upper():
                 continue
-            if not args.all and is_submode(sname):
+            if not args.all and is_submode(sname, device.skip_suffixes):
                 if not args.quiet:
                     print(f"  {sname}: [SKIP] sub-mode")
                 continue
@@ -252,7 +277,6 @@ def cmd_patch(args: argparse.Namespace) -> int:
                 continue
 
             push_back_va = last_slot.push_back_target_va
-
             if not args.quiet:
                 missing_str = ", ".join(cap_name(c) for c in missing)
                 print(f"  {sname}: appending {missing_str}")
@@ -268,65 +292,16 @@ def cmd_patch(args: argparse.Namespace) -> int:
                 print(f"  {sname}: [SKIP] {e}")
                 continue
 
-
-    if args.stream:
-        stream_hooks = find_all_stream_hooks(image)
-        if not stream_hooks:
-            print("ERROR: No stream config hooks found")
-            return 1
-
-        print(f"\nStream config: {len(stream_hooks)} camera(s)")
-
-        sensor_streams: dict[str, list[str]] = getattr(args, "sensor_streams", {})
-
-        def stream_priority(h):
-            for i, m in enumerate(main_sensors):
-                if m in h.sensor_name:
-                    return i
-            return 999
-
-        stream_hooks.sort(key=stream_priority)
-
-        for hook in stream_hooks:
-            if priority_key(find_sensor_sym(syms, hook.sensor_name)) >= 999:
-                continue  # non-main sensors after caps spread
-            if args.sensor and args.sensor.upper() not in hook.sensor_name.upper():
-                continue
-
-            hook_entries = None
-            for sens, e_list in sensor_streams.items():
-                if sens.upper() in hook.sensor_name.upper():
-                    hook_entries = e_list
-                    break
-            if hook_entries is None:
-                hook_entries = args.stream_entries_list
-
-            entries = parse_stream_entries(hook_entries)
-            if not entries:
-                entries = [(32, 640, 480, 0, 0x3F940AA, 0x1FCA055)]
-
-            try:
-                stream_patches = make_stream_append_patches(
-                    image, hook.hook_va, profile, allocator, entries,
-                )
-                patches.extend(stream_patches)
-            except ValueError as e:
-                print(f"  {hook.sensor_name}: [SKIP] {e}")
-                continue
-            if not args.quiet:
-                print(f"  {hook.sensor_name}: hook 0x{hook.hook_va:x} -> cave ({len(entries)} entries)")
-
-
-    if cap_spec:
+        # Other sensors
         cap_other_done = 0
         cap_other_skip = 0
         for sym in syms:
-            if priority_key(sym) < 999:
+            sname = sensor_short_name(sym.name, device.sensor_prefix)
+            if device.is_main_sensor(sname):
                 continue
-            sname = sensor_short_name(sym.name)
             if args.sensor and args.sensor.upper() not in sname.upper():
                 continue
-            if not args.all and is_submode(sname):
+            if not args.all and is_submode(sname, device.skip_suffixes):
                 continue
 
             block = find_capability_block(image, sym.value, sym.size)
@@ -357,35 +332,63 @@ def cmd_patch(args: argparse.Namespace) -> int:
         if not args.quiet and cap_other_done:
             print(f"\nOther sensor caps: {cap_other_done} patched, {cap_other_skip} skipped (no space)")
 
-
+    # ── Stream config patches ─────────────────────────────────────────
     if args.stream:
+        stream_hooks = find_all_stream_hooks(image, device.sensor_prefix)
+        if not stream_hooks:
+            print("ERROR: No stream config hooks found")
+            return 1
+
+        print(f"\nStream config: {len(stream_hooks)} camera(s)")
+
+        sensor_streams: dict[str, list[str]] = getattr(args, "sensor_streams", {})
+
+        def stream_priority(h):
+            return device.get_priority(h.sensor_name)
+
+        stream_hooks.sort(key=stream_priority)
+
+        stream_main_done = 0
         stream_other_done = 0
         stream_other_skip = 0
+
+        main_overrides = sensor_streams if sensor_streams else None
+
         for hook in stream_hooks:
-            if priority_key(find_sensor_sym(syms, hook.sensor_name)) < 999:
+            sname = hook.sensor_name
+            if not device.is_main_sensor(sname):
                 continue
-            if args.sensor and args.sensor.upper() not in hook.sensor_name.upper():
+            if args.sensor and args.sensor.upper() not in sname.upper():
                 continue
 
-            hook_entries = None
-            for sens, e_list in sensor_streams.items():
-                if sens.upper() in hook.sensor_name.upper():
-                    hook_entries = e_list
-                    break
-            if hook_entries is None:
-                hook_entries = args.stream_entries_list
-
-            entries = parse_stream_entries(hook_entries)
-            if not entries:
-                entries = [(32, 640, 480, 0, 0x3F940AA, 0x1FCA055)]
-
+            entries = device.stream_entries_for(sname, main_overrides)
             try:
                 stream_patches = make_stream_append_patches(
                     image, hook.hook_va, profile, allocator, entries,
                 )
                 patches.extend(stream_patches)
                 if not args.quiet:
-                    print(f"  {hook.sensor_name}: hook 0x{hook.hook_va:x} -> cave ({len(entries)} entries)")
+                    print(f"  {sname}: hook 0x{hook.hook_va:x} -> cave ({len(entries)} entries)")
+                stream_main_done += 1
+            except ValueError as e:
+                print(f"  {sname}: [SKIP] {e}")
+                continue
+
+        for hook in stream_hooks:
+            sname = hook.sensor_name
+            if device.is_main_sensor(sname):
+                continue
+            if args.sensor and args.sensor.upper() not in sname.upper():
+                continue
+
+            entries = device.stream_entries_for(sname, main_overrides)
+            try:
+                stream_patches = make_stream_append_patches(
+                    image, hook.hook_va, profile, allocator, entries,
+                )
+                patches.extend(stream_patches)
+                if not args.quiet:
+                    print(f"  {sname}: hook 0x{hook.hook_va:x} -> cave ({len(entries)} entries)")
                 stream_other_done += 1
             except ValueError:
                 stream_other_skip += 1
@@ -393,6 +396,7 @@ def cmd_patch(args: argparse.Namespace) -> int:
         if not args.quiet and stream_other_done:
             print(f"\nOther sensor streams: {stream_other_done} patched, {stream_other_skip} skipped (no space)")
 
+    # ── Apply ─────────────────────────────────────────────────────────
     if not patches:
         print("\nNothing to patch.")
         return 0
@@ -415,9 +419,9 @@ def cmd_patch(args: argparse.Namespace) -> int:
 
 
 def cmd_verify(args: argparse.Namespace) -> int:
-    """Verify original vs patched binary."""
     original = args.original.read_bytes()
     patched = args.patched.read_bytes()
+    device: DeviceConfig = args.device_obj
 
     result = compare_binaries(original, patched)
 
@@ -445,17 +449,34 @@ def cmd_verify(args: argparse.Namespace) -> int:
     else:
         print("\nNo differences found (binaries are identical).")
 
-    # Detect already-patched state
-    PLT_CAVE_VA = 0xAB064  # .text end in this binary
-    if detect_already_patched(original, patched, PLT_CAVE_VA):
+    if detect_already_patched(original, patched, device.plt_cave_va):
         print("\n[DETECTED] Patched binary shows BL redirects to cave — appears already patched.")
 
     print(f"\nTotal changed bytes: {result.total_changed}")
     return 0
 
 
+def cmd_validate(args: argparse.Namespace) -> int:
+    """Run device.validate_library() on a binary and report issues."""
+    data = args.path.read_bytes()
+    device: DeviceConfig = args.device_obj
+
+    print(f"Validating {args.path}  ({device.name})")
+    print(f"  Size:    {len(data)} bytes")
+    print(f"  SHA256:  {__import__('hashlib').sha256(data).hexdigest()}")
+    print()
+
+    issues = device.validate_library(data)
+    if issues:
+        print("Validation issues:")
+        for iss in issues:
+            print(f"  [{chr(10007)}] {iss}")
+        return 1
+    print("  All checks passed.")
+    return 0
+
+
 def cmd_gen_config(args: argparse.Namespace) -> int:
-    """Generate a default config.toml."""
     content = generate_default()
     if args.output:
         args.output.write_text(content)
@@ -466,7 +487,6 @@ def cmd_gen_config(args: argparse.Namespace) -> int:
 
 
 def parse_cap_values(value_str: str) -> list[int]:
-    """Parse comma-separated cap values or names -> list of ints."""
     result = []
     for token in value_str.split(","):
         token = token.strip()
@@ -493,10 +513,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         "--config", type=Path,
         help="Path to config.toml (settings merged with CLI flags)",
     )
+    parser.add_argument(
+        "--device", type=str, default="INOI_A75",
+        help='Device profile (default: INOI_A75). Available: INOI_A75, ADVAN_X1',
+    )
 
     sub = parser.add_subparsers(title="commands")
 
-    # Collect per-subparser defaults for config merging
     _sub_defaults: dict[str, dict[str, object]] = {}
 
     # inspect
@@ -537,7 +560,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_patch.add_argument(
         "--tier", type=str, default="",
         help='Desired capability set; only missing ones are appended in this order '
-             '(e.g. "RAW,MANUAL_SENSOR,MANUAL_POST_PROCESSING"). Overrides --caps.',
+             '(e.g. "RAW,MANUAL_SENSOR,MANUAL_POST_PROCESSING"). Overrides --caps '
+             'and device default tier.',
     )
     p_patch.add_argument(
         "--sensor", help="Only patch specific sensor name substring",
@@ -564,6 +588,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
     )
     p_patch.add_argument(
+        "--validate", action="store_true", dest="validate_first",
+        help="Run device.validate_library() before patching",
+    )
+    p_patch.add_argument(
+        "--force", action="store_true",
+        help="Patch even if validation issues are found (use with --validate)",
+    )
+    p_patch.add_argument(
         "-q", "--quiet", action="store_true",
         help="Suppress per-sensor progress messages",
     )
@@ -582,6 +614,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_verify.set_defaults(func=cmd_verify)
     _sub_defaults["verify"] = {}
 
+    # validate
+    p_val = sub.add_parser(
+        "validate", help="Run device self-tests on a binary"
+    )
+    p_val.add_argument("path", type=Path, help="Path to .so library")
+    p_val.set_defaults(func=cmd_validate)
+    _sub_defaults["validate"] = {}
+
     # gen-config
     p_gen = sub.add_parser(
         "gen-config", help="Generate a default config.toml"
@@ -594,6 +634,14 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     args = parser.parse_args(argv)
 
+    # Resolve device before config merge (needed for hal_format_meta)
+    try:
+        device = get_device(args.device)
+    except KeyError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    args.device_obj = device
+
     # Merge config.toml into parsed args (CLI flags take precedence)
     if hasattr(args, "config") and args.config:
         try:
@@ -602,7 +650,6 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"ERROR: Failed to load config: {e}", file=sys.stderr)
             return 1
 
-        # Determine which subcommand was invoked
         invoked = getattr(args, "func", None)
         sub_name = None
         for name, cmd_func in [
@@ -610,6 +657,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             ("analyze", cmd_analyze),
             ("patch", cmd_patch),
             ("verify", cmd_verify),
+            ("validate", cmd_validate),
         ]:
             if invoked is cmd_func:
                 sub_name = name
@@ -617,7 +665,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         defaults = _sub_defaults.get(sub_name, {})
         args_dict = vars(args)
-        merge_config_into_args(config, args_dict, defaults)
+        merge_config_into_args(config, args_dict, defaults, device.hal_format_meta)
         args = argparse.Namespace(**args_dict)
 
     return args.func(args)
