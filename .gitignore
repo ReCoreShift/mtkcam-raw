@@ -13,3 +13,4 @@ build/
 *.so
 bin/*.so
 .DS_Store
+out/

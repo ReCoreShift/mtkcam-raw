@@ -729,7 +729,8 @@ ADVAN_X1 = _register(DeviceConfig(
     ),
     sensors=(
         SensorConfig(prefix="IMX686", role="back", priority=0, raw_enabled=True),
-        SensorConfig(prefix="HI846", role="front", priority=1, raw_enabled=True),
+        SensorConfig(prefix="GC08A3", role="front", priority=1, raw_enabled=True),
+        SensorConfig(prefix="IMX782", role="back", priority=2, raw_enabled=True),
     ),
     patches=PatchSet(
         hwlevel=PatchDef(

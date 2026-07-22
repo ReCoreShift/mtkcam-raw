@@ -499,7 +499,7 @@ def make_stream_append_patches(
         raise ValueError(f"Cannot find file offset for VA 0x{hook_va:x}")
 
     tramp_size = _stream_trampoline_size(entries)
-    cave = allocator.allocate(tramp_size, prefer_extend=True, prefer_gap=False)
+    cave = allocator.allocate(tramp_size)
 
     orig_bl = image.data[hook_off : hook_off + 4]
     new_bl = encode_bl(hook_va, cave.va)
