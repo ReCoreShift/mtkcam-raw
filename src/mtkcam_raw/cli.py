@@ -30,6 +30,7 @@ from mtkcam_raw.metadata import (
 from mtkcam_raw.trampoline import (
     make_capability_append_patches,
     make_stream_append_patches,
+    _stream_trampoline_size,
     parse_stream_entries,
 )
 from mtkcam_raw.patch import (
@@ -240,7 +241,43 @@ def cmd_patch(args: argparse.Namespace) -> int:
         sensor_short_name(s.name, device.sensor_prefix)
     ))
 
-    # ── Capability patches ────────────────────────────────────────────
+    # ── Pre-compute stream hooks if requested ─────────────────────────
+    stream_hooks: list | None = None
+    stream_main_done = 0
+    stream_other_done = 0
+    stream_other_skip = 0
+    if args.stream:
+        stream_hooks = find_all_stream_hooks(image, device.sensor_prefix)
+        if not stream_hooks:
+            print("ERROR: No stream config hooks found")
+            return 1
+        print(f"\nStream config: {len(stream_hooks)} camera(s)")
+        sensor_streams = getattr(args, "sensor_streams", {})
+        def stream_priority(h):
+            return device.get_priority(h.sensor_name)
+        stream_hooks.sort(key=stream_priority)
+        main_overrides = sensor_streams if sensor_streams else None
+
+    # ── Phase 1: Main sensors (streams first, then caps) ──────────────
+    if stream_hooks:
+        for hook in stream_hooks:
+            sname = hook.sensor_name
+            if not device.is_main_sensor(sname):
+                continue
+            if args.sensor and args.sensor.upper() not in sname.upper():
+                continue
+            entries = device.stream_entries_for(sname, main_overrides)
+            try:
+                stream_patches = make_stream_append_patches(
+                    image, hook.hook_va, profile, allocator, entries,
+                )
+                patches.extend(stream_patches)
+                if not args.quiet:
+                    print(f"  {sname}: hook 0x{hook.hook_va:x} -> cave ({len(entries)} entries)")
+                stream_main_done += 1
+            except ValueError as e:
+                print(f"  {sname}: [SKIP] {e}")
+
     if cap_spec:
         if not image.check_bind_now():
             print("ERROR: BIND_NOW not set; PLT[0] cave is unsafe")
@@ -249,7 +286,6 @@ def cmd_patch(args: argparse.Namespace) -> int:
         desired_caps = parse_cap_values(cap_spec)
         print(f"\nDesired capabilities ({cap_intent}): {[cap_name(c) for c in desired_caps]}")
 
-        # Main sensors
         for sym in syms:
             sname = sensor_short_name(sym.name, device.sensor_prefix)
             if not device.is_main_sensor(sname):
@@ -292,9 +328,31 @@ def cmd_patch(args: argparse.Namespace) -> int:
                 print(f"  {sname}: [SKIP] {e}")
                 continue
 
-        # Other sensors
-        cap_other_done = 0
-        cap_other_skip = 0
+    # ── Phase 2: Other sensors (split remaining space 50/50) ──────────
+    remaining = allocator.remaining
+    other_cap_budget = remaining // 2 if cap_spec else 0
+    other_cap_used = 0
+    cap_other_done = 0
+    cap_other_skip = 0
+    cap_raw_dropped = 0
+
+    # Pre-compute which other sensors can get stream entries (fits in budget)
+    other_stream_budget = remaining - other_cap_budget
+    other_stream_used = 0
+    other_stream_can_add: set[str] = set()
+    if stream_hooks:
+        for hook in stream_hooks:
+            sname = hook.sensor_name
+            if device.is_main_sensor(sname):
+                continue
+            entries = device.stream_entries_for(sname, main_overrides)
+            needed = _stream_trampoline_size(entries)
+            if other_stream_used + needed <= other_stream_budget:
+                other_stream_used += needed
+                other_stream_can_add.add(sname)
+
+    if cap_spec:
+        raw_val = 3
         for sym in syms:
             sname = sensor_short_name(sym.name, device.sensor_prefix)
             if device.is_main_sensor(sname):
@@ -312,16 +370,33 @@ def cmd_patch(args: argparse.Namespace) -> int:
             if not missing:
                 continue
 
+            # Don't add RAW without its corresponding stream entry
+            has_stream_hook = stream_hooks and any(
+                h.sensor_name == sname for h in stream_hooks
+            )
+            if raw_val in missing and has_stream_hook and sname not in other_stream_can_add:
+                missing = [c for c in missing if c != raw_val]
+                cap_raw_dropped += 1
+                if not missing:
+                    continue
+
             last_slot = block.slots[-1]
             if last_slot.push_back_target_va is None:
                 continue
 
+            needed = 16 + 20 * len(missing)
+            if other_cap_used + needed > other_cap_budget:
+                cap_other_skip += 1
+                continue
+
             try:
+                before = allocator.remaining
                 cap_patches = make_capability_append_patches(
                     image, last_slot.file_offset,
                     missing, last_slot.push_back_target_va, allocator,
                 )
                 patches.extend(cap_patches)
+                other_cap_used += before - allocator.remaining
                 if not args.quiet:
                     missing_str = ", ".join(cap_name(c) for c in missing)
                     print(f"  {sname}: appending {missing_str}")
@@ -329,64 +404,30 @@ def cmd_patch(args: argparse.Namespace) -> int:
             except ValueError:
                 cap_other_skip += 1
 
+        if cap_raw_dropped and not args.quiet:
+            print(f"  ({cap_raw_dropped} sensors: RAW dropped — no stream budget)")
         if not args.quiet and cap_other_done:
-            print(f"\nOther sensor caps: {cap_other_done} patched, {cap_other_skip} skipped (no space)")
+            print(f"\nOther sensor caps: {cap_other_done} patched, {cap_other_skip} skipped (no space/budget)")
 
-    # ── Stream config patches ─────────────────────────────────────────
-    if args.stream:
-        stream_hooks = find_all_stream_hooks(image, device.sensor_prefix)
-        if not stream_hooks:
-            print("ERROR: No stream config hooks found")
-            return 1
-
-        print(f"\nStream config: {len(stream_hooks)} camera(s)")
-
-        sensor_streams: dict[str, list[str]] = getattr(args, "sensor_streams", {})
-
-        def stream_priority(h):
-            return device.get_priority(h.sensor_name)
-
-        stream_hooks.sort(key=stream_priority)
-
-        stream_main_done = 0
-        stream_other_done = 0
-        stream_other_skip = 0
-
-        main_overrides = sensor_streams if sensor_streams else None
-
-        for hook in stream_hooks:
-            sname = hook.sensor_name
-            if not device.is_main_sensor(sname):
-                continue
-            if args.sensor and args.sensor.upper() not in sname.upper():
-                continue
-
-            entries = device.stream_entries_for(sname, main_overrides)
-            try:
-                stream_patches = make_stream_append_patches(
-                    image, hook.hook_va, profile, allocator, entries,
-                )
-                patches.extend(stream_patches)
-                if not args.quiet:
-                    print(f"  {sname}: hook 0x{hook.hook_va:x} -> cave ({len(entries)} entries)")
-                stream_main_done += 1
-            except ValueError as e:
-                print(f"  {sname}: [SKIP] {e}")
-                continue
-
+    if stream_hooks:
+        other_stream_used = 0
         for hook in stream_hooks:
             sname = hook.sensor_name
             if device.is_main_sensor(sname):
                 continue
+            if sname not in other_stream_can_add:
+                stream_other_skip += 1
+                continue
             if args.sensor and args.sensor.upper() not in sname.upper():
                 continue
-
             entries = device.stream_entries_for(sname, main_overrides)
             try:
+                before = allocator.remaining
                 stream_patches = make_stream_append_patches(
                     image, hook.hook_va, profile, allocator, entries,
                 )
                 patches.extend(stream_patches)
+                other_stream_used += before - allocator.remaining
                 if not args.quiet:
                     print(f"  {sname}: hook 0x{hook.hook_va:x} -> cave ({len(entries)} entries)")
                 stream_other_done += 1
@@ -394,7 +435,7 @@ def cmd_patch(args: argparse.Namespace) -> int:
                 stream_other_skip += 1
 
         if not args.quiet and stream_other_done:
-            print(f"\nOther sensor streams: {stream_other_done} patched, {stream_other_skip} skipped (no space)")
+            print(f"\nOther sensor streams: {stream_other_done} patched, {stream_other_skip} skipped (no space/budget)")
 
     # ── Apply ─────────────────────────────────────────────────────────
     if not patches:

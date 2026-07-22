@@ -62,10 +62,12 @@ resolve_lib() {
   local dev_upper="${dev^^}"
   # Replace hyphens with underscores for variable matching
   local dev_var="${dev_upper//-/_}"
+  local dev_lc="${dev,,}"
   # Check for device-specific binary
   for candidate in \
     "$SCRIPT_DIR/${dev_var}_libmtkcam_metastore.so" \
     "$SCRIPT_DIR/${dev}_libmtkcam_metastore.so" \
+    "$SCRIPT_DIR/bin/libmtkcam_metastore.so.${dev_lc}" \
     "$SCRIPT_DIR/bin/libmtkcam_metastore.so"; do
     if [ -f "$candidate" ]; then
       echo "$candidate"

@@ -1,6 +1,7 @@
 main_sensors = [
     "IMX686",
-    "HI846",
+    "GC08A3",
+    "IMX782",
 ]
 
 tier = [
@@ -17,6 +18,9 @@ stream = true
 IMX686 = [
     {width = 4624, height = 3472},
 ]
-HI846 = [
+GC08A3 = [
     {width = 3264, height = 2448},
+]
+IMX782 = [
+    {width = 4624, height = 3472},
 ]
